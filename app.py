@@ -17,11 +17,16 @@ The server starts on http://localhost:5000 by default.
 """
 
 import os
+import re
+import secrets
+import sqlite3
+import sys
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, session, g
 from flask_cors import CORS
+from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
 from breeze_connect import BreezeConnect
 
@@ -37,24 +42,587 @@ if not APP_API_KEY or not APP_API_SECRET:
           "Copy .env.example to .env and fill them in before connecting.")
 
 app = Flask(__name__)
-CORS(app, origins=[FRONTEND_ORIGIN])
+CORS(app, origins=[FRONTEND_ORIGIN], supports_credentials=True)
 
-# Single in-memory session for local/personal use.
-# NOTE: this is fine for one person running this locally. It is NOT
-# multi-user safe — do not deploy this as-is for multiple simultaneous users
-# without adding per-user session storage (e.g. keyed by a server-side
-# login cookie).
-state = {
-    "breeze": None,       # BreezeConnect instance once session is live
-    "connected_at": None,
-    "customer_details": None,
-}
+# ---------------------------------------------------------------------------
+# App login, users and admin console
+#   * Users live in a SQLite file (app.db) — tables: users, reset_requests, audit_log.
+#   * Passwords and recovery words are stored as salted hashes. Nobody — including the
+#     admin — can read them back; the admin can issue a temporary password instead.
+#   * Admin accounts can only be created by this server (seeded below). Registration
+#     through the web page always creates a normal user.
+#   * A normal user can log in only after the admin marks payment as "paid".
+#   * Every /api/* route except the public auth ones requires a valid login.
+#   * Each logged-in user gets their OWN Breeze session (see user_state / state below).
+# ---------------------------------------------------------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.getenv("APP_DB", os.path.join(BASE_DIR, "app.db"))
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "starmeshraja")
+# Default admin password — it is only used to CREATE the admin the first time. Change it after
+# your first login; once an admin exists in app.db this default is never used again.
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "Newjersy^!74")
+HASH_METHOD = os.getenv("PASSWORD_HASH_METHOD", "pbkdf2:sha256:600000")
+MAX_FAILED_LOGINS = 5
+LOCK_MINUTES = 15
+
+
+def _load_secret_key():
+    env_key = os.getenv("SECRET_KEY")
+    if env_key:
+        return env_key
+    path = os.path.join(BASE_DIR, ".secret_key")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            key = fh.read().strip()
+            if key:
+                return key
+    except OSError:
+        pass
+    key = secrets.token_hex(32)
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(key)
+    except OSError:
+        pass  # sessions will simply reset when the server restarts
+    return key
+
+
+app.secret_key = _load_secret_key()
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.getenv("COOKIE_SECURE", "0") == "1",
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+)
+
+
+def _utcnow():
+    return datetime.now(timezone.utc)
+
+
+def _iso(dt=None):
+    return (dt or _utcnow()).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _hash(value):
+    return generate_password_hash(value, method=HASH_METHOD)
+
+
+_DUMMY_HASH = _hash("not-a-real-password")  # makes unknown usernames cost the same time as real ones
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    username             TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    password_hash        TEXT NOT NULL,
+    recovery_hash        TEXT,
+    role                 TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('admin', 'user')),
+    full_name            TEXT,
+    email                TEXT,
+    phone                TEXT,
+    payment_status       TEXT NOT NULL DEFAULT 'pending' CHECK (payment_status IN ('pending', 'paid')),
+    payment_reference    TEXT,
+    paid_on              TEXT,
+    is_active            INTEGER NOT NULL DEFAULT 1,
+    must_change_password INTEGER NOT NULL DEFAULT 0,
+    failed_logins        INTEGER NOT NULL DEFAULT 0,
+    locked_until         TEXT,
+    created_at           TEXT NOT NULL,
+    last_login_at        TEXT
+);
+CREATE TABLE IF NOT EXISTS reset_requests (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    username     TEXT NOT NULL,
+    note         TEXT,
+    status       TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'done', 'dismissed')),
+    requested_at TEXT NOT NULL,
+    resolved_at  TEXT,
+    resolved_by  TEXT
+);
+CREATE TABLE IF NOT EXISTS audit_log (
+    id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    at     TEXT NOT NULL,
+    actor  TEXT,
+    action TEXT NOT NULL,
+    target TEXT,
+    detail TEXT,
+    ip     TEXT
+);
+"""
+
+
+def _connect():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def db():
+    if "db" not in g:
+        g.db = _connect()
+    return g.db
+
+
+@app.teardown_appcontext
+def _close_db(_exc):
+    conn = g.pop("db", None)
+    if conn is not None:
+        conn.close()
+
+
+def init_db():
+    conn = _connect()
+    try:
+        conn.executescript(SCHEMA)
+        if not conn.execute("SELECT 1 FROM users WHERE role = 'admin' LIMIT 1").fetchone():
+            conn.execute(
+                "INSERT INTO users (username, password_hash, role, full_name, payment_status, paid_on, created_at) "
+                "VALUES (?, ?, 'admin', 'Administrator', 'paid', ?, ?)",
+                (ADMIN_USERNAME, _hash(ADMIN_PASSWORD), _iso(), _iso()),
+            )
+            conn.commit()
+            print(f"Admin account '{ADMIN_USERNAME}' created. Log in and change its password.")
+    finally:
+        conn.close()
+
+
+def audit(action, target=None, detail=None, actor=None):
+    if actor is None:
+        user = getattr(g, "user", None)
+        actor = user["username"] if user else None
+    db().execute(
+        "INSERT INTO audit_log (at, actor, action, target, detail, ip) VALUES (?, ?, ?, ?, ?, ?)",
+        (_iso(), actor, action, target, detail, request.remote_addr),
+    )
+    db().commit()
+
+
+def public_user(row):
+    return {
+        "id": row["id"],
+        "username": row["username"],
+        "role": row["role"],
+        "full_name": row["full_name"],
+        "email": row["email"],
+        "phone": row["phone"],
+        "payment_status": row["payment_status"],
+        "must_change_password": bool(row["must_change_password"]),
+    }
+
+
+# ---- per-user Breeze state --------------------------------------------------
+# The route code below keeps using `state["breeze"]`, `state["watchlist"]` ... but `state`
+# now resolves to the CURRENT LOGGED-IN USER's own dict, so one user can never see or
+# trade through another user's broker session.
+_USER_STATES = {}
+
+
+def user_state(uid):
+    if uid not in _USER_STATES:
+        _USER_STATES[uid] = {
+            "breeze": None,
+            "connected_at": None,
+            "customer_details": None,
+            "watchlist": list(DEFAULT_WATCHLIST),
+        }
+    return _USER_STATES[uid]
+
+
+class _CurrentUserState:
+    def _d(self):
+        user = getattr(g, "user", None)
+        if user is None:
+            raise RuntimeError("No logged-in user in this request")
+        return user_state(user["id"])
+
+    def __getitem__(self, key):
+        return self._d()[key]
+
+    def __setitem__(self, key, value):
+        self._d()[key] = value
+
+    def get(self, key, default=None):
+        return self._d().get(key, default)
+
+    def __contains__(self, key):
+        return key in self._d()
+
+
+state = _CurrentUserState()
 
 
 def require_session():
     if state["breeze"] is None:
         return jsonify({"error": "No active Breeze session. Connect first."}), 401
     return None
+
+
+PUBLIC_PATHS = {
+    "/api/auth/register",
+    "/api/auth/login",
+    "/api/auth/reset-password",
+    "/api/auth/request-reset",
+    "/api/auth/me",
+}
+
+
+@app.before_request
+def _auth_gate():
+    if request.method == "OPTIONS" or not request.path.startswith("/api/"):
+        return None
+    g.user = None
+    uid = session.get("uid")
+    if uid:
+        row = db().execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
+        # checked on EVERY request, so blocking a user or un-marking payment takes effect immediately
+        if row and row["is_active"] and (row["role"] == "admin" or row["payment_status"] == "paid"):
+            g.user = row
+        else:
+            session.clear()
+    if request.path in PUBLIC_PATHS:
+        return None
+    if g.user is None:
+        return jsonify({"error": "Please log in.", "auth_required": True}), 401
+    if request.path.startswith("/api/admin/") and g.user["role"] != "admin":
+        return jsonify({"error": "Admin only."}), 403
+    if g.user["must_change_password"] and request.path not in ("/api/auth/change-password", "/api/auth/logout"):
+        return jsonify({"error": "You must change your temporary password first.", "must_change_password": True}), 403
+    return None
+
+
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{3,32}$")
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_REG_LOG = {}  # ip -> recent registration timestamps (simple flood guard)
+
+
+def _password_problem(password, username):
+    if len(password) < 8:
+        return "Password must be at least 8 characters."
+    if len(password) > 128:
+        return "Password is too long (max 128 characters)."
+    if password.lower() == (username or "").lower():
+        return "Password must not be the same as the username."
+    return None
+
+
+def _norm_word(word):
+    return " ".join(str(word or "").lower().split())
+
+
+def _record_failure(row):
+    """Count a failed password / recovery-word attempt; lock the account after too many."""
+    n = (row["failed_logins"] or 0) + 1
+    locked = None
+    if n >= MAX_FAILED_LOGINS:
+        locked = _iso(_utcnow() + timedelta(minutes=LOCK_MINUTES))
+        n = 0
+    db().execute("UPDATE users SET failed_logins = ?, locked_until = ? WHERE id = ?", (n, locked, row["id"]))
+    db().commit()
+
+
+def _is_locked(row):
+    return bool(row and row["locked_until"] and row["locked_until"] > _iso())
+
+
+@app.route("/api/auth/register", methods=["POST"])
+def auth_register():
+    body = request.get_json(silent=True) or {}
+    username = str(body.get("username", "")).strip()
+    password = str(body.get("password", ""))
+    full_name = str(body.get("full_name", "")).strip()[:80]
+    email = str(body.get("email", "")).strip()[:120]
+    phone = str(body.get("phone", "")).strip()[:20]
+    recovery = _norm_word(body.get("recovery_word"))
+    payment_ref = str(body.get("payment_reference", "")).strip()[:120]
+
+    if not _USERNAME_RE.match(username):
+        return jsonify({"error": "Username must be 3-32 characters: letters, digits, dot, dash or underscore."}), 400
+    problem = _password_problem(password, username)
+    if problem:
+        return jsonify({"error": problem}), 400
+    if not full_name:
+        return jsonify({"error": "Please enter your full name."}), 400
+    if not _EMAIL_RE.match(email):
+        return jsonify({"error": "Please enter a valid email address."}), 400
+    if len(recovery) < 4:
+        return jsonify({"error": "Recovery word must be at least 4 characters (you will need it to reset your password)."}), 400
+
+    now = _utcnow().timestamp()
+    recent = [t for t in _REG_LOG.get(request.remote_addr, []) if now - t < 3600]
+    if len(recent) >= 5:
+        return jsonify({"error": "Too many registrations from this address. Try again later."}), 429
+    _REG_LOG[request.remote_addr] = recent + [now]
+
+    try:
+        # role is NEVER taken from the request — web registration can only create normal users
+        db().execute(
+            "INSERT INTO users (username, password_hash, recovery_hash, role, full_name, email, phone, "
+            "payment_status, payment_reference, created_at) VALUES (?, ?, ?, 'user', ?, ?, ?, 'pending', ?, ?)",
+            (username, _hash(password), _hash(recovery), full_name, email, phone, payment_ref or None, _iso()),
+        )
+        db().commit()
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "That username is already taken."}), 409
+    audit("register", target=username, actor=username)
+    return jsonify({"ok": True, "message": "Registered. You can log in once the admin confirms your payment."}), 201
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def auth_login():
+    body = request.get_json(silent=True) or {}
+    username = str(body.get("username", "")).strip()
+    password = str(body.get("password", ""))
+    row = db().execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+
+    if _is_locked(row):
+        return jsonify({"error": f"Too many failed attempts. Try again in about {LOCK_MINUTES} minutes."}), 429
+    password_ok = check_password_hash(row["password_hash"] if row else _DUMMY_HASH, password)
+    if not (row and password_ok):
+        if row:
+            _record_failure(row)
+        audit("login_failed", target=username, actor=username)
+        return jsonify({"error": "Invalid username or password."}), 401
+
+    # the password is right — only now reveal account-state problems
+    if not row["is_active"]:
+        return jsonify({"error": "This account has been blocked. Please contact the admin."}), 403
+    if row["role"] != "admin" and row["payment_status"] != "paid":
+        return jsonify({"error": "Your payment has not been confirmed yet. You can log in once the admin marks it as paid.", "payment_pending": True}), 403
+
+    db().execute("UPDATE users SET failed_logins = 0, locked_until = NULL, last_login_at = ? WHERE id = ?", (_iso(), row["id"]))
+    db().commit()
+    session.clear()
+    session["uid"] = row["id"]
+    session.permanent = True
+    g.user = row
+    audit("login", target=username, actor=username)
+    return jsonify({"user": public_user(row)})
+
+
+@app.route("/api/auth/me", methods=["GET"])
+def auth_me():
+    user = getattr(g, "user", None)
+    return jsonify({"user": public_user(user) if user else None})
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def auth_logout():
+    user = g.user
+    _USER_STATES.pop(user["id"], None)  # drops this user's Breeze session too
+    audit("logout", target=user["username"])
+    session.clear()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/auth/change-password", methods=["POST"])
+def auth_change_password():
+    body = request.get_json(silent=True) or {}
+    user = g.user
+    if not check_password_hash(user["password_hash"], str(body.get("old_password", ""))):
+        return jsonify({"error": "Current password is incorrect."}), 400
+    new_password = str(body.get("new_password", ""))
+    problem = _password_problem(new_password, user["username"])
+    if problem:
+        return jsonify({"error": problem}), 400
+    db().execute("UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?", (_hash(new_password), user["id"]))
+    db().commit()
+    audit("change_password", target=user["username"])
+    return jsonify({"ok": True})
+
+
+@app.route("/api/auth/reset-password", methods=["POST"])
+def auth_reset_password():
+    """Self-service reset with the recovery word chosen at registration."""
+    body = request.get_json(silent=True) or {}
+    username = str(body.get("username", "")).strip()
+    new_password = str(body.get("new_password", ""))
+    row = db().execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    generic = (jsonify({"error": "Invalid username or recovery word."}), 400)
+
+    if _is_locked(row):
+        return jsonify({"error": f"Too many failed attempts. Try again in about {LOCK_MINUTES} minutes."}), 429
+    stored = row["recovery_hash"] if row and row["role"] != "admin" and row["recovery_hash"] else None
+    word_ok = check_password_hash(stored or _DUMMY_HASH, _norm_word(body.get("recovery_word")))
+    if not (stored and word_ok):
+        if row:
+            _record_failure(row)
+        audit("reset_failed", target=username, actor=username)
+        return generic
+    problem = _password_problem(new_password, username)
+    if problem:
+        return jsonify({"error": problem}), 400
+    db().execute(
+        "UPDATE users SET password_hash = ?, must_change_password = 0, failed_logins = 0, locked_until = NULL WHERE id = ?",
+        (_hash(new_password), row["id"]),
+    )
+    db().commit()
+    audit("reset_password_self", target=username, actor=username)
+    return jsonify({"ok": True, "message": "Password changed. You can log in now."})
+
+
+@app.route("/api/auth/request-reset", methods=["POST"])
+def auth_request_reset():
+    """For users who forgot the recovery word too: leaves a request for the admin."""
+    body = request.get_json(silent=True) or {}
+    username = str(body.get("username", "")).strip()
+    note = str(body.get("note", "")).strip()[:200]
+    row = db().execute("SELECT id FROM users WHERE username = ? AND role = 'user'", (username,)).fetchone()
+    if row and not db().execute("SELECT 1 FROM reset_requests WHERE username = ? AND status = 'open'", (username,)).fetchone():
+        db().execute("INSERT INTO reset_requests (username, note, requested_at) VALUES (?, ?, ?)", (username, note, _iso()))
+        db().commit()
+        audit("reset_requested", target=username, actor=username)
+    # same answer whether or not the username exists
+    return jsonify({"ok": True, "message": "If that account exists, the admin has been notified and will give you a temporary password."})
+
+
+# ---- admin console API ----------------------------------------------------------------------
+def _admin_user_dict(r):
+    return {
+        "id": r["id"], "username": r["username"], "role": r["role"], "full_name": r["full_name"],
+        "email": r["email"], "phone": r["phone"], "payment_status": r["payment_status"],
+        "payment_reference": r["payment_reference"], "paid_on": r["paid_on"], "is_active": bool(r["is_active"]),
+        "must_change_password": bool(r["must_change_password"]), "created_at": r["created_at"],
+        "last_login_at": r["last_login_at"], "locked": _is_locked(r), "has_recovery_word": bool(r["recovery_hash"]),
+        "has_broker_session": bool(_USER_STATES.get(r["id"], {}).get("breeze")),
+    }
+
+
+def _target_user(uid):
+    return db().execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
+
+
+@app.route("/api/admin/users", methods=["GET"])
+def admin_users():
+    rows = db().execute("SELECT * FROM users ORDER BY id").fetchall()
+    users = [_admin_user_dict(r) for r in rows]
+    normal = [u for u in users if u["role"] == "user"]
+    stats = {
+        "total_users": len(normal),
+        "paid": sum(1 for u in normal if u["payment_status"] == "paid"),
+        "awaiting_payment": sum(1 for u in normal if u["payment_status"] != "paid"),
+        "blocked": sum(1 for u in normal if not u["is_active"]),
+        "open_reset_requests": db().execute("SELECT COUNT(*) FROM reset_requests WHERE status = 'open'").fetchone()[0],
+    }
+    return jsonify({"users": users, "stats": stats})
+
+
+@app.route("/api/admin/users/<int:uid>/payment", methods=["POST"])
+def admin_set_payment(uid):
+    body = request.get_json(silent=True) or {}
+    status = body.get("status")
+    row = _target_user(uid)
+    if not row or row["role"] != "user":
+        return jsonify({"error": "Normal user not found."}), 404
+    if status not in ("paid", "pending"):
+        return jsonify({"error": "status must be 'paid' or 'pending'."}), 400
+    reference = str(body.get("reference", "")).strip()[:120] or row["payment_reference"]
+    db().execute(
+        "UPDATE users SET payment_status = ?, payment_reference = ?, paid_on = ? WHERE id = ?",
+        (status, reference, _iso() if status == "paid" else None, uid),
+    )
+    db().commit()
+    if status != "paid":
+        _USER_STATES.pop(uid, None)
+    audit("payment_" + status, target=row["username"], detail=reference)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/admin/users/<int:uid>/active", methods=["POST"])
+def admin_set_active(uid):
+    body = request.get_json(silent=True) or {}
+    row = _target_user(uid)
+    if not row or row["role"] != "user":
+        return jsonify({"error": "Normal user not found."}), 404
+    active = 1 if body.get("active") else 0
+    db().execute("UPDATE users SET is_active = ? WHERE id = ?", (active, uid))
+    db().commit()
+    if not active:
+        _USER_STATES.pop(uid, None)
+    audit("unblock" if active else "block", target=row["username"])
+    return jsonify({"ok": True})
+
+
+@app.route("/api/admin/users/<int:uid>/reset-password", methods=["POST"])
+def admin_reset_password(uid):
+    row = _target_user(uid)
+    if not row or row["role"] != "user":
+        return jsonify({"error": "Normal user not found."}), 404
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+    temp = "".join(secrets.choice(alphabet) for _ in range(12))
+    db().execute(
+        "UPDATE users SET password_hash = ?, must_change_password = 1, failed_logins = 0, locked_until = NULL WHERE id = ?",
+        (_hash(temp), uid),
+    )
+    db().execute(
+        "UPDATE reset_requests SET status = 'done', resolved_at = ?, resolved_by = ? WHERE username = ? AND status = 'open'",
+        (_iso(), g.user["username"], row["username"]),
+    )
+    db().commit()
+    audit("admin_reset_password", target=row["username"])
+    return jsonify({"ok": True, "temp_password": temp})  # shown to the admin once; only a hash is kept
+
+
+@app.route("/api/admin/users/<int:uid>", methods=["DELETE"])
+def admin_delete_user(uid):
+    row = _target_user(uid)
+    if not row or row["role"] != "user":
+        return jsonify({"error": "Normal user not found."}), 404
+    db().execute("DELETE FROM users WHERE id = ?", (uid,))
+    db().commit()
+    _USER_STATES.pop(uid, None)
+    audit("delete_user", target=row["username"])
+    return jsonify({"ok": True})
+
+
+@app.route("/api/admin/reset-requests", methods=["GET"])
+def admin_reset_requests():
+    rows = db().execute("SELECT * FROM reset_requests ORDER BY (status = 'open') DESC, id DESC LIMIT 200").fetchall()
+    return jsonify({"requests": [dict(r) for r in rows]})
+
+
+@app.route("/api/admin/reset-requests/<int:rid>/dismiss", methods=["POST"])
+def admin_dismiss_request(rid):
+    db().execute(
+        "UPDATE reset_requests SET status = 'dismissed', resolved_at = ?, resolved_by = ? WHERE id = ? AND status = 'open'",
+        (_iso(), g.user["username"], rid),
+    )
+    db().commit()
+    audit("reset_request_dismissed", target=str(rid))
+    return jsonify({"ok": True})
+
+
+@app.route("/api/admin/audit", methods=["GET"])
+def admin_audit():
+    rows = db().execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 300").fetchall()
+    return jsonify({"entries": [dict(r) for r in rows]})
+
+
+def _cli_reset_admin():
+    """python app.py reset-admin   — set a new password for the admin if you ever lose it."""
+    import getpass
+
+    pw1 = getpass.getpass(f"New password for admin '{ADMIN_USERNAME}': ")
+    if pw1 != getpass.getpass("Repeat the new password: "):
+        print("Passwords do not match.")
+        return
+    problem = _password_problem(pw1, ADMIN_USERNAME)
+    if problem:
+        print(problem)
+        return
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "UPDATE users SET password_hash = ?, must_change_password = 0, failed_logins = 0, locked_until = NULL, is_active = 1 "
+            "WHERE username = ? AND role = 'admin'",
+            (_hash(pw1), ADMIN_USERNAME),
+        )
+        conn.commit()
+        print("Admin password updated." if cur.rowcount else f"No admin named '{ADMIN_USERNAME}' found.")
+    finally:
+        conn.close()
+
+
+init_db()
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +706,7 @@ DEFAULT_WATCHLIST = [
     {"label": "Infosys",    "stock_code": "INFTEC", "exchange_code": "NSE", "product_type": "cash"},
     {"label": "HDFC Bank",  "stock_code": "HDFBAN", "exchange_code": "NSE", "product_type": "cash"},
 ]
-state["watchlist"] = list(DEFAULT_WATCHLIST)
+# (each user's watchlist starts from DEFAULT_WATCHLIST — see user_state())
 
 # A handful of common indices Breeze supports that don't show up well
 # through get_names() (which is built for equities). Offered as suggestions
@@ -868,16 +1436,15 @@ def bot_quotes():
 
 # ---------------------------------------------------------------------------
 # REAL order placement for the Trading Bot.
-#   * LOCKED by default: nothing below can place an order unless ENABLE_REAL_TRADING=1
-#     is set in the backend .env and Flask is restarted.
-#   * Options only (NIFTY / NFO), market or limit, quantity capped by BOT_MAX_REAL_QTY.
+#   * Switched on from the web page (Trading Bot switches 3 / 4 + typed REAL confirmation).
+#     Needs a logged-in, paid user with a live Breeze session of their own.
+#   * Options only (NIFTY / NFO), market or limit, quantity capped by BOT_MAX_REAL_QTY (exchange freeze limit).
 #   * Every attempt (accepted or not) is appended to real_orders.log for audit.
 # The paper-trading UI never calls these endpoints.
 # ---------------------------------------------------------------------------
 import json as _json
 
-ENABLE_REAL_TRADING = os.getenv("ENABLE_REAL_TRADING", "0") == "1"
-BOT_MAX_REAL_QTY = int(os.getenv("BOT_MAX_REAL_QTY", "130"))
+BOT_MAX_REAL_QTY = int(os.getenv("BOT_MAX_REAL_QTY", "1800"))  # NIFTY freeze quantity per order
 REAL_ORDER_LOG = os.getenv("REAL_ORDER_LOG", "real_orders.log")
 ORDER_EXPIRY_TIME = os.getenv("BREEZE_ORDER_EXPIRY_TIME_UTC", "06:00:00.000Z")
 
@@ -885,22 +1452,21 @@ ORDER_EXPIRY_TIME = os.getenv("BREEZE_ORDER_EXPIRY_TIME_UTC", "06:00:00.000Z")
 def _log_real_order(entry):
     try:
         with open(REAL_ORDER_LOG, "a", encoding="utf-8") as fh:
-            fh.write(_json.dumps({"at": datetime.now(IST).isoformat(), **entry}, default=str) + "\n")
+            who = g.user["username"] if getattr(g, "user", None) else None
+            fh.write(_json.dumps({"at": datetime.now(IST).isoformat(), "user": who, **entry}, default=str) + "\n")
     except OSError:
         pass
 
 
 @app.route("/api/bot/real-status", methods=["GET"])
 def bot_real_status():
-    return jsonify({"enabled": ENABLE_REAL_TRADING, "max_qty": BOT_MAX_REAL_QTY})
+    return jsonify({"enabled": True, "max_qty": BOT_MAX_REAL_QTY})
 
 
 @app.route("/api/bot/real-order", methods=["POST"])
 def bot_real_order():
     """body: {"expiry": "YYYY-MM-DD", "right": "call|put", "strike": 22900, "action": "buy|sell",
               "quantity": 65, "order_type": "market|limit", "price": 0, "remark": "..."}"""
-    if not ENABLE_REAL_TRADING:
-        return jsonify({"error": "Real trading is disabled on the server (set ENABLE_REAL_TRADING=1 in .env and restart)."}), 403
     err = require_session()
     if err:
         return err
@@ -978,4 +1544,7 @@ def bot_order_status():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "reset-admin":
+        _cli_reset_admin()
+        sys.exit(0)
     app.run(port=PORT, debug=True)

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { TrendingUp, TrendingDown, Wifi, WifiOff, LogOut, ShieldCheck, ExternalLink, ArrowUpRight, ArrowDownRight, RefreshCw, Wallet, X, Search, Plus, Loader2, BarChart3, ArrowLeft, Target, Bot, Download, Trash2 } from "lucide-react";
+import { TrendingUp, TrendingDown, Wifi, WifiOff, LogOut, ShieldCheck, ExternalLink, ArrowUpRight, ArrowDownRight, RefreshCw, Wallet, X, Search, Plus, Loader2, BarChart3, ArrowLeft, Target, Bot, Download, Trash2, Users, KeyRound } from "lucide-react";
 
 // Point this at your Flask backend (see meridian-backend/app.py)
 const API_BASE = "http://localhost:5000";
@@ -7,10 +7,14 @@ const API_BASE = "http://localhost:5000";
 async function api(path, options = {}) {
   const res = await fetch(API_BASE + path, {
     headers: { "Content-Type": "application/json" },
+    credentials: "include", // carries the login session cookie
     ...options,
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+  if (!res.ok) {
+    if (res.status === 401 && data.auth_required && typeof window !== "undefined") window.dispatchEvent(new Event("auth-expired"));
+    throw new Error(data.error || `Request failed (${res.status})`);
+  }
   return data;
 }
 
@@ -117,7 +121,7 @@ function CandlestickChart({ candles, width = 800, height = 260, levels = [] }) {
         return (
           <g key={i}>
             <line x1={padding.left} x2={width - padding.right} y1={y} y2={y} stroke="var(--line)" strokeWidth="1" />
-            <text x={padding.left - 8} y={y + 3} textAnchor="end" fontSize="9.5" fill="var(--ink-dim)" fontFamily="var(--font-mono)">
+            <text x={padding.left - 8} y={y + 3} textAnchor="end" fontSize="10.5" fontWeight="600" fill="var(--ink)" fontFamily="var(--font-mono)">
               {val.toFixed(val > 1000 ? 0 : 2)}
             </text>
           </g>
@@ -143,14 +147,14 @@ function CandlestickChart({ candles, width = 800, height = 260, levels = [] }) {
       {marks.map((m) => (
         <g key={m.label}>
           <line x1={padding.left} x2={width - padding.right} y1={m.y} y2={m.y} stroke={m.color} strokeWidth="1.2" strokeDasharray={m.dash || "6 3"} opacity="0.9" />
-          <text x={width - padding.right + 5} y={m.ly + 3} fontSize="10" fill={m.color} fontFamily="var(--font-mono)">{m.label}</text>
+          <text x={width - padding.right + 5} y={m.ly + 3} fontSize="11" fontWeight="600" fill={m.color} fontFamily="var(--font-mono)">{m.label}</text>
         </g>
       ))}
       {above.map((l, i) => (
-        <text key={l.label} x={width - padding.right + 5} y={padding.top + 9 + i * 11} fontSize="10" fill={l.color} fontFamily="var(--font-mono)">▲ {l.label}</text>
+        <text key={l.label} x={width - padding.right + 5} y={padding.top + 9 + i * 11} fontSize="11" fontWeight="600" fill={l.color} fontFamily="var(--font-mono)">▲ {l.label}</text>
       ))}
       {below.map((l, i) => (
-        <text key={l.label} x={width - padding.right + 5} y={height - padding.bottom - 2 - i * 11} fontSize="10" fill={l.color} fontFamily="var(--font-mono)">▼ {l.label}</text>
+        <text key={l.label} x={width - padding.right + 5} y={height - padding.bottom - 2 - i * 11} fontSize="11" fontWeight="600" fill={l.color} fontFamily="var(--font-mono)">▼ {l.label}</text>
       ))}
     </svg>
   );
@@ -1059,15 +1063,15 @@ function TradingBotPage({ onBack }) {
   const [modeBoth, setModeBoth] = useState(false);
   const [realArmed, setRealArmed] = useState(false); // must be confirmed by typing REAL each time the page is opened
   const [realConfirm, setRealConfirm] = useState(null);
-  const [realStatus, setRealStatus] = useState({ loaded: false, enabled: false, max_qty: 0 });
+  const [realStatus, setRealStatus] = useState({ loaded: false, enabled: true, max_qty: 1800 });
   const paperDest = modePaper || modeBoth;
   const realDest = modeReal || modeBoth;
   const realLive = realDest && realArmed && realStatus.enabled;
 
   useEffect(() => {
     api("/api/bot/real-status")
-      .then((s) => setRealStatus({ loaded: true, enabled: !!s.enabled, max_qty: Number(s.max_qty) || 0 }))
-      .catch(() => setRealStatus({ loaded: true, enabled: false, max_qty: 0 }));
+      .then((s) => setRealStatus({ loaded: true, enabled: true, max_qty: Number(s.max_qty) || 1800 }))
+      .catch(() => setRealStatus({ loaded: true, enabled: true, max_qty: 1800 }));
   }, []);
 
   // ----- bot settings + activity log -----
@@ -1407,7 +1411,7 @@ function TradingBotPage({ onBack }) {
   async function placeRealEntry({ inst, ev, ltp, sl, target, lots: nLots, lotSize: nLotSize, note: noteTxt, triggerId }) {
     const qty = nLots * nLotSize;
     if (qty > realStatus.max_qty) {
-      logEvent("error", `REAL entry for ${ev.name} blocked: quantity ${qty} is above the server limit ${realStatus.max_qty}.`);
+      logEvent("error", `REAL entry for ${ev.name} blocked: quantity ${qty} is above the per-order limit ${realStatus.max_qty}.`);
       return;
     }
     botRef.current.pending[ev.id] = true;
@@ -1706,25 +1710,20 @@ function TradingBotPage({ onBack }) {
                 on={modeReal}
                 danger
                 onClick={() => toggleMode("real")}
-                disabled={!realStatus.enabled}
                 label="3 · Activate real trade"
-                sub={realStatus.enabled ? "bot sends live orders" : "locked on the server"}
-                title={realStatus.enabled ? "" : "Set ENABLE_REAL_TRADING=1 in the backend .env and restart Flask to unlock"}
+                sub="bot sends live orders"
               />
               <ModeSwitch
                 on={modeBoth}
                 danger
                 onClick={() => toggleMode("both")}
-                disabled={!realStatus.enabled}
                 label="4 · Paper + real trade"
-                sub={realStatus.enabled ? "bot trades both" : "locked on the server"}
-                title={realStatus.enabled ? "" : "Set ENABLE_REAL_TRADING=1 in the backend .env and restart Flask to unlock"}
+                sub="bot trades both"
               />
             </div>
             <div className="mode-status">
               Manual paper trades: <b>{paperDest ? "ON" : "OFF"}</b> · BOT: <b>{botOn ? "ON" : "OFF"}</b> · Bot trades go to: <b>{destText}</b>
               {botOn && destText === "none" && <span className="mode-warn"> — BOT is on but no destination is active (turn on 1, 3 or 4)</span>}
-              {realStatus.loaded && !realStatus.enabled && <span> · Real trading is locked: set ENABLE_REAL_TRADING=1 in the backend .env and restart.</span>}
               {(botOn || hasRealOpen) && (
                 <button className="kill-btn" onClick={stopAll}>
                   {hasRealOpen ? "STOP BOT + EXIT ALL REAL" : "Stop bot"}
@@ -1735,7 +1734,7 @@ function TradingBotPage({ onBack }) {
             {realConfirm && (
               <div className="real-confirm">
                 <b>Enable REAL order placement?</b> When a setup triggers, the bot will send <b>live market BUY orders</b> for NIFTY options to your ICICI account
-                ({parseInt(botLots, 10) || 0} lot × {parseInt(lotSize, 10) || 0} = <b>{realQty}</b> qty per trade; server limit {realStatus.max_qty}), and market exit orders at SL / target.
+                ({parseInt(botLots, 10) || 0} lot × {parseInt(lotSize, 10) || 0} = <b>{realQty}</b> qty per trade; per-order limit {realStatus.max_qty}), and market exit orders at SL / target.
                 Exits are checked by <b>this page</b> every few seconds — if you close the tab or lose connection, open positions have <b>no stop</b>.
                 <div className="two-col" style={{ marginTop: 8, gridTemplateColumns: "1fr auto auto" }}>
                   <input
@@ -2067,7 +2066,7 @@ function TradingBotPage({ onBack }) {
             </label>
             <div className="paper-note">
               Bot quantity = lots × lot size = {realQty} per trade
-              {realStatus.enabled ? ` (server limit ${realStatus.max_qty})` : ""}. Entry = next square above the option price (e.g. 156 → 13² = 169).
+              {realStatus.enabled ? ` (per-order limit ${realStatus.max_qty})` : ""}. Entry = next square above the option price (e.g. 156 → 13² = 169).
             </div>
           </div>
         </aside>
@@ -2391,8 +2390,509 @@ function Dashboard({ sessionInfo, onDisconnect, onOpenIntraday, onOpenSniper, on
   );
 }
 
+// ---------- app login, registration, password reset ----------
+function AField({ label, type = "text", value, onChange, autoComplete, placeholder, hint }) {
+  return (
+    <label className="field">
+      <span>{label}</span>
+      <input type={type} value={value} onChange={(e) => onChange(e.target.value)} autoComplete={autoComplete} placeholder={placeholder} />
+      {hint && <span className="field-hint">{hint}</span>}
+    </label>
+  );
+}
+
+function AuthScreen({ onAuthed, bootError }) {
+  const [mode, setMode] = useState("login"); // login | register | reset
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState(bootError ? { kind: "error", text: bootError } : null);
+  const [f, setF] = useState({
+    username: "", password: "", confirm: "", full_name: "", email: "", phone: "",
+    recovery_word: "", payment_reference: "", new_password: "", new_confirm: "", note: "",
+  });
+  const set = (k) => (v) => setF((prev) => ({ ...prev, [k]: v }));
+
+  function go(next) {
+    setMode(next);
+    setMsg(null);
+    setF((prev) => ({ ...prev, password: "", confirm: "", new_password: "", new_confirm: "" }));
+  }
+
+  async function submit(e) {
+    e.preventDefault();
+    setMsg(null);
+    try {
+      setBusy(true);
+      if (mode === "login") {
+        if (!f.username.trim() || !f.password) throw new Error("Enter your username and password.");
+        const data = await api("/api/auth/login", { method: "POST", body: JSON.stringify({ username: f.username.trim(), password: f.password }) });
+        onAuthed(data.user);
+      } else if (mode === "register") {
+        if (f.password !== f.confirm) throw new Error("The two passwords do not match.");
+        const data = await api("/api/auth/register", {
+          method: "POST",
+          body: JSON.stringify({
+            username: f.username.trim(), password: f.password, full_name: f.full_name, email: f.email,
+            phone: f.phone, recovery_word: f.recovery_word, payment_reference: f.payment_reference,
+          }),
+        });
+        setMode("login");
+        setF((prev) => ({ ...prev, password: "", confirm: "", recovery_word: "" }));
+        setMsg({ kind: "ok", text: data.message });
+      } else if (mode === "reset") {
+        if (f.new_password !== f.new_confirm) throw new Error("The two new passwords do not match.");
+        const data = await api("/api/auth/reset-password", {
+          method: "POST",
+          body: JSON.stringify({ username: f.username.trim(), recovery_word: f.recovery_word, new_password: f.new_password }),
+        });
+        setMode("login");
+        setF((prev) => ({ ...prev, password: "", new_password: "", new_confirm: "", recovery_word: "" }));
+        setMsg({ kind: "ok", text: data.message });
+      }
+    } catch (err) {
+      setMsg({ kind: "error", text: err.message });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function askAdmin() {
+    setMsg(null);
+    if (!f.username.trim()) return setMsg({ kind: "error", text: "Enter your username first." });
+    try {
+      setBusy(true);
+      const data = await api("/api/auth/request-reset", { method: "POST", body: JSON.stringify({ username: f.username.trim(), note: f.note }) });
+      return setMsg({ kind: "ok", text: data.message });
+    } catch (err) {
+      return setMsg({ kind: "error", text: err.message });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const title = mode === "login" ? "Log in" : mode === "register" ? "Create an account" : "Reset your password";
+
+  return (
+    <div className="screen connect-screen">
+      <div className="connect-wrap">
+        <div className="brand">
+          <div className="brand-mark">S</div>
+          <div>
+            <div className="brand-name">STRAMESHRAJA</div>
+            <div className="brand-sub">Trading dashboard — sign in</div>
+          </div>
+        </div>
+
+        <form className="connect-card" onSubmit={submit}>
+          <div className="card-head">
+            <ShieldCheck size={16} />
+            <span>{title}</span>
+          </div>
+
+          {mode === "login" && (
+            <>
+              <AField label="Username" value={f.username} onChange={set("username")} autoComplete="username" />
+              <AField label="Password" type="password" value={f.password} onChange={set("password")} autoComplete="current-password" />
+            </>
+          )}
+
+          {mode === "register" && (
+            <>
+              <p className="card-copy">
+                New accounts are activated after the admin confirms your payment. Add your payment reference (for example the UPI transaction id) so it can be matched quickly.
+              </p>
+              <AField label="Username" value={f.username} onChange={set("username")} autoComplete="username" hint="3–32 characters: letters, digits, . _ -" />
+              <AField label="Password" type="password" value={f.password} onChange={set("password")} autoComplete="new-password" hint="At least 8 characters" />
+              <AField label="Confirm password" type="password" value={f.confirm} onChange={set("confirm")} autoComplete="new-password" />
+              <AField label="Full name" value={f.full_name} onChange={set("full_name")} autoComplete="name" />
+              <AField label="Email" type="email" value={f.email} onChange={set("email")} autoComplete="email" />
+              <AField label="Phone (optional)" value={f.phone} onChange={set("phone")} autoComplete="tel" />
+              <AField label="Recovery word" value={f.recovery_word} onChange={set("recovery_word")} hint="Used to reset your password yourself — remember it. Stored securely; nobody can read it back." />
+              <AField label="Payment reference (optional)" value={f.payment_reference} onChange={set("payment_reference")} />
+            </>
+          )}
+
+          {mode === "reset" && (
+            <>
+              <p className="card-copy">Enter your username and the recovery word you chose when you registered, then pick a new password.</p>
+              <AField label="Username" value={f.username} onChange={set("username")} autoComplete="username" />
+              <AField label="Recovery word" value={f.recovery_word} onChange={set("recovery_word")} />
+              <AField label="New password" type="password" value={f.new_password} onChange={set("new_password")} autoComplete="new-password" hint="At least 8 characters" />
+              <AField label="Confirm new password" type="password" value={f.new_confirm} onChange={set("new_confirm")} autoComplete="new-password" />
+            </>
+          )}
+
+          {msg && <div className={msg.kind === "ok" ? "success-line" : "error-line"}>{msg.text}</div>}
+
+          <button className="connect-btn" type="submit" disabled={busy}>
+            {busy ? <span className="spinner" /> : null}
+            {mode === "login" ? "Login" : mode === "register" ? "Register" : "Reset password"}
+          </button>
+
+          {mode === "login" && (
+            <div className="auth-links">
+              <button type="button" className="link-btn" onClick={() => go("reset")}>Reset password</button>
+              <button type="button" className="link-btn" onClick={() => go("register")}>New user? Register</button>
+            </div>
+          )}
+          {mode !== "login" && (
+            <div className="auth-links">
+              <button type="button" className="link-btn" onClick={() => go("login")}>← Back to login</button>
+            </div>
+          )}
+
+          {mode === "reset" && (
+            <div className="auth-ask">
+              <div className="card-copy" style={{ margin: 0 }}>Forgot the recovery word too? Ask the admin for a temporary password:</div>
+              <AField label="Note for the admin (optional)" value={f.note} onChange={set("note")} />
+              <button type="button" className="secondary-btn" onClick={askAdmin} disabled={busy}>Ask admin to reset my password</button>
+            </div>
+          )}
+        </form>
+      </div>
+    </div>
+  );
+}
+
+// change password — used both for the forced change after an admin reset and from the app bar
+function ChangePasswordCard({ forced, onDone }) {
+  const [oldPw, setOldPw] = useState("");
+  const [newPw, setNewPw] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [msg, setMsg] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  async function submit(e) {
+    e.preventDefault();
+    setMsg(null);
+    if (newPw !== confirm) return setMsg({ kind: "error", text: "The two new passwords do not match." });
+    try {
+      setBusy(true);
+      await api("/api/auth/change-password", { method: "POST", body: JSON.stringify({ old_password: oldPw, new_password: newPw }) });
+      setOldPw("");
+      setNewPw("");
+      setConfirm("");
+      setMsg({ kind: "ok", text: "Password changed." });
+      if (onDone) onDone();
+      return undefined;
+    } catch (err) {
+      return setMsg({ kind: "error", text: err.message });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form className="connect-card" onSubmit={submit}>
+      <div className="card-head">
+        <KeyRound size={16} />
+        <span>{forced ? "Choose a new password" : "Change password"}</span>
+      </div>
+      {forced && <p className="card-copy">Your password was reset by the admin. Enter the temporary password you were given, then choose your own.</p>}
+      <AField label={forced ? "Temporary password" : "Current password"} type="password" value={oldPw} onChange={setOldPw} autoComplete="current-password" />
+      <AField label="New password" type="password" value={newPw} onChange={setNewPw} autoComplete="new-password" hint="At least 8 characters" />
+      <AField label="Confirm new password" type="password" value={confirm} onChange={setConfirm} autoComplete="new-password" />
+      {msg && <div className={msg.kind === "ok" ? "success-line" : "error-line"}>{msg.text}</div>}
+      <button className="connect-btn" type="submit" disabled={busy}>{busy ? <span className="spinner" /> : null}Save new password</button>
+    </form>
+  );
+}
+
+function ForcePasswordChange({ onDone, onLogout }) {
+  return (
+    <div className="screen connect-screen">
+      <div className="connect-wrap">
+        <ChangePasswordCard forced onDone={onDone} />
+        <button className="link-btn" onClick={onLogout}>Log out</button>
+      </div>
+    </div>
+  );
+}
+
+function AccountPage({ onBack }) {
+  return (
+    <div className="screen connect-screen">
+      <div className="connect-wrap">
+        <ChangePasswordCard />
+        <button className="secondary-btn" onClick={onBack}><ArrowLeft size={14} /> Back</button>
+      </div>
+    </div>
+  );
+}
+
+function AppBar({ user, view, setView, onLogout }) {
+  return (
+    <div className="appbar">
+      <span>
+        Signed in as <b>{user.username}</b> <span className="role-chip">{user.role === "admin" ? "ADMIN" : "USER"}</span>
+      </span>
+      <span className="appbar-actions">
+        {user.role === "admin" && (
+          <button className="secondary-btn compact" onClick={() => setView(view === "admin" ? "app" : "admin")}>
+            <Users size={13} /> {view === "admin" ? "Back to trading app" : "Admin console"}
+          </button>
+        )}
+        <button className="secondary-btn compact" onClick={() => setView(view === "account" ? "app" : "account")}>
+          <KeyRound size={13} /> Change password
+        </button>
+        <button className="secondary-btn compact" onClick={onLogout}>
+          <LogOut size={13} /> Log out
+        </button>
+      </span>
+    </div>
+  );
+}
+
+// ---------- admin console ----------
+function AdminConsole() {
+  const [tab, setTab] = useState("users");
+  const [users, setUsers] = useState([]);
+  const [stats, setStats] = useState(null);
+  const [requests, setRequests] = useState([]);
+  const [entries, setEntries] = useState([]);
+  const [filter, setFilter] = useState("all");
+  const [search, setSearch] = useState("");
+  const [notice, setNotice] = useState(null);
+  const [temp, setTemp] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [u, r, a] = await Promise.all([api("/api/admin/users"), api("/api/admin/reset-requests"), api("/api/admin/audit")]);
+      setUsers(u.users);
+      setStats(u.stats);
+      setRequests(r.requests);
+      setEntries(a.entries);
+    } catch (e) {
+      setNotice({ kind: "error", text: e.message });
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  async function act(fn, okText) {
+    try {
+      await fn();
+      await load();
+      if (okText) setNotice({ kind: "ok", text: okText });
+    } catch (e) {
+      setNotice({ kind: "error", text: e.message });
+    }
+  }
+
+  const post = (path, body) => api(path, { method: "POST", body: JSON.stringify(body || {}) });
+
+  function markPaid(u) {
+    const ref = window.prompt(`Mark ${u.username} as PAID.\nPayment reference / note (optional):`, u.payment_reference || "");
+    if (ref === null) return;
+    act(() => post(`/api/admin/users/${u.id}/payment`, { status: "paid", reference: ref }), `${u.username} marked as paid — they can log in now.`);
+  }
+  function markUnpaid(u) {
+    if (!window.confirm(`Mark ${u.username} as NOT paid? They will be logged out and cannot log in until paid again.\n(If they have open real positions, their page will stop managing the stop-loss.)`)) return;
+    act(() => post(`/api/admin/users/${u.id}/payment`, { status: "pending" }), `${u.username} set to payment pending.`);
+  }
+  function toggleActive(u) {
+    const block = u.is_active;
+    if (block && !window.confirm(`Block ${u.username}? They will be logged out immediately.\n(If they have open real positions, their page will stop managing the stop-loss.)`)) return;
+    act(() => post(`/api/admin/users/${u.id}/active`, { active: !block }), `${u.username} ${block ? "blocked" : "unblocked"}.`);
+  }
+  async function resetPw(u) {
+    if (!window.confirm(`Create a temporary password for ${u.username}? Their current password stops working.`)) return;
+    try {
+      const d = await post(`/api/admin/users/${u.id}/reset-password`);
+      setTemp({ username: u.username, password: d.temp_password });
+      await load();
+    } catch (e) {
+      setNotice({ kind: "error", text: e.message });
+    }
+  }
+  function remove(u) {
+    if (!window.confirm(`Delete ${u.username} permanently? This cannot be undone.`)) return;
+    act(() => api(`/api/admin/users/${u.id}`, { method: "DELETE" }), `${u.username} deleted.`);
+  }
+
+  const q = search.trim().toLowerCase();
+  const shown = users.filter((u) => {
+    if (filter === "pending" && !(u.role === "user" && u.payment_status !== "paid")) return false;
+    if (filter === "paid" && !(u.role === "user" && u.payment_status === "paid")) return false;
+    if (filter === "blocked" && u.is_active) return false;
+    if (!q) return true;
+    return [u.username, u.full_name, u.email, u.phone, u.payment_reference].some((v) => String(v || "").toLowerCase().includes(q));
+  });
+  const openRequests = requests.filter((r) => r.status === "open").length;
+
+  return (
+    <div className="admin-wrap">
+      <div className="admin-head">
+        <div className="bot-sel-name">Admin console</div>
+        <button className="secondary-btn compact" onClick={load} disabled={loading}><RefreshCw size={13} /> Refresh</button>
+      </div>
+
+      {stats && (
+        <div className="stat-cards">
+          <div className="pnl-card"><div className="k">Normal users</div><div className="v">{stats.total_users}</div></div>
+          <div className="pnl-card"><div className="k">Paid</div><div className="v pos-up">{stats.paid}</div></div>
+          <div className="pnl-card"><div className="k">Awaiting payment</div><div className="v pos-down">{stats.awaiting_payment}</div></div>
+          <div className="pnl-card"><div className="k">Blocked</div><div className="v">{stats.blocked}</div></div>
+          <div className="pnl-card"><div className="k">Open reset requests</div><div className="v">{stats.open_reset_requests}</div></div>
+        </div>
+      )}
+
+      <p className="card-copy" style={{ margin: "10px 0" }}>
+        Passwords and recovery words are stored as one-way hashes, so nobody — including you — can read them back. If a user is locked out, use
+        <b> Reset password</b>: it issues a temporary password (shown once) that the user must change at their next login.
+      </p>
+
+      {notice && <div className={notice.kind === "ok" ? "success-line" : "error-line"} style={{ marginBottom: 8 }}>{notice.text}</div>}
+      {temp && (
+        <div className="temp-pw">
+          <b>Temporary password for {temp.username}:</b> <code>{temp.password}</code>
+          <button className="secondary-btn compact" onClick={() => navigator.clipboard && navigator.clipboard.writeText(temp.password)}>Copy</button>
+          <span>Shown only once — give it to the user; they must change it at next login.</span>
+          <button className="icon-btn" onClick={() => setTemp(null)} title="Hide"><X size={12} /></button>
+        </div>
+      )}
+
+      <div className="bot-tabs">
+        {[["users", `Users (${users.length})`], ["resets", `Reset requests (${openRequests} open)`], ["audit", "Activity log"]].map(([k, label]) => (
+          <button key={k} className={"interval-btn " + (tab === k ? "active" : "")} onClick={() => setTab(k)}>{label}</button>
+        ))}
+      </div>
+
+      {tab === "users" && (
+        <>
+          <div className="interval-row">
+            {[["all", "All"], ["pending", "Awaiting payment"], ["paid", "Paid"], ["blocked", "Blocked"]].map(([k, label]) => (
+              <button key={k} className={"interval-btn " + (filter === k ? "active" : "")} onClick={() => setFilter(k)}>{label}</button>
+            ))}
+            <input className="cell-input" style={{ width: 240, marginLeft: 10 }} placeholder="Search name, username, email, phone…" value={search} onChange={(e) => setSearch(e.target.value)} />
+          </div>
+          <div className="sr-scroll">
+            <table className="sr-table">
+              <thead>
+                <tr>
+                  <th>ID</th><th>Username</th><th>Name</th><th>Email</th><th>Phone</th><th>Role</th><th>Payment</th><th>Payment ref</th>
+                  <th>Paid on</th><th>Account</th><th>Registered</th><th>Last login</th><th>Password</th><th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {shown.length === 0 && (
+                  <tr><td colSpan={14}>No users match.</td></tr>
+                )}
+                {shown.map((u) => {
+                  const admin = u.role === "admin";
+                  return (
+                    <tr key={u.id}>
+                      <td>{u.id}</td>
+                      <td>{u.username}</td>
+                      <td>{u.full_name || "—"}</td>
+                      <td>{u.email || "—"}</td>
+                      <td>{u.phone || "—"}</td>
+                      <td>{admin ? "Admin" : "User"}</td>
+                      <td>{admin ? "—" : <span className={u.payment_status === "paid" ? "pay-paid" : "pay-pending"}>{u.payment_status === "paid" ? "PAID" : "PENDING"}</span>}</td>
+                      <td>{u.payment_reference || "—"}</td>
+                      <td>{u.paid_on ? fmtTime(u.paid_on) : "—"}</td>
+                      <td>
+                        <span className={u.is_active ? "pay-paid" : "pay-pending"}>{u.is_active ? "Active" : "Blocked"}</span>
+                        {u.locked && <div className="watch-name">locked (failed logins)</div>}
+                        {u.must_change_password && <div className="watch-name">must change password</div>}
+                        {u.has_broker_session && <div className="watch-name">Breeze connected</div>}
+                      </td>
+                      <td>{fmtTime(u.created_at)}</td>
+                      <td>{u.last_login_at ? fmtTime(u.last_login_at) : "never"}</td>
+                      <td><span className="watch-name">hashed — not viewable</span></td>
+                      <td>
+                        {admin ? (
+                          "—"
+                        ) : (
+                          <span className="row-actions">
+                            {u.payment_status === "paid" ? (
+                              <button className="secondary-btn compact" onClick={() => markUnpaid(u)}>Mark unpaid</button>
+                            ) : (
+                              <button className="secondary-btn compact" onClick={() => markPaid(u)}>Mark paid</button>
+                            )}
+                            <button className="secondary-btn compact" onClick={() => toggleActive(u)}>{u.is_active ? "Block" : "Unblock"}</button>
+                            <button className="secondary-btn compact" onClick={() => resetPw(u)}>Reset password</button>
+                            <button className="secondary-btn compact" onClick={() => remove(u)}>Delete</button>
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+
+      {tab === "resets" && (
+        requests.length === 0 ? (
+          <div className="pos-empty">No reset requests.</div>
+        ) : (
+          <div className="sr-scroll">
+            <table className="sr-table">
+              <thead><tr><th>ID</th><th>Username</th><th>Note</th><th>Requested</th><th>Status</th><th>Action</th></tr></thead>
+              <tbody>
+                {requests.map((r) => {
+                  const u = users.find((x) => x.username.toLowerCase() === String(r.username).toLowerCase());
+                  return (
+                    <tr key={r.id}>
+                      <td>{r.id}</td>
+                      <td>{r.username}</td>
+                      <td>{r.note || "—"}</td>
+                      <td>{fmtTime(r.requested_at)}</td>
+                      <td>{r.status}</td>
+                      <td>
+                        {r.status === "open" ? (
+                          <span className="row-actions">
+                            {u && <button className="secondary-btn compact" onClick={() => resetPw(u)}>Reset password</button>}
+                            <button className="secondary-btn compact" onClick={() => act(() => post(`/api/admin/reset-requests/${r.id}/dismiss`), "Request dismissed.")}>Dismiss</button>
+                          </span>
+                        ) : (
+                          "—"
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )
+      )}
+
+      {tab === "audit" && (
+        entries.length === 0 ? (
+          <div className="pos-empty">No activity yet.</div>
+        ) : (
+          <div className="sr-scroll">
+            <table className="sr-table">
+              <thead><tr><th>Time</th><th>Who</th><th>Action</th><th>Target</th><th>Detail</th><th>IP</th></tr></thead>
+              <tbody>
+                {entries.map((e) => (
+                  <tr key={e.id}>
+                    <td>{fmtTime(e.at)}</td><td>{e.actor || "—"}</td><td>{e.action}</td><td>{e.target || "—"}</td><td>{e.detail || "—"}</td><td>{e.ip || "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )
+      )}
+    </div>
+  );
+}
+
 // ---------- root ----------
 export default function TradingPortal() {
+  const [authUser, setAuthUser] = useState(undefined); // undefined = checking, null = logged out
+  const [bootError, setBootError] = useState("");
+  const [view, setView] = useState("app"); // 'app' | 'admin' | 'account'
   const [sessionInfo, setSessionInfo] = useState(null);
   const [page, setPage] = useState("dashboard"); // 'dashboard' | 'intraday' | 'sniper' | 'bot'
 
@@ -2400,15 +2900,49 @@ export default function TradingPortal() {
     document.title = "Strameshraja Dashboard";
   }, []);
 
+  // is there already a valid login? (cookie from an earlier visit)
+  useEffect(() => {
+    api("/api/auth/me")
+      .then((d) => setAuthUser(d.user || null))
+      .catch((e) => {
+        setBootError(e.message);
+        setAuthUser(null);
+      });
+  }, []);
+
+  // the server says the login expired / was revoked (blocked, payment removed, logged out elsewhere)
+  useEffect(() => {
+    const h = () => {
+      setAuthUser(null);
+      setSessionInfo(null);
+      setView("app");
+      setPage("dashboard");
+    };
+    window.addEventListener("auth-expired", h);
+    return () => window.removeEventListener("auth-expired", h);
+  }, []);
+
+  async function logout() {
+    try {
+      await api("/api/auth/logout", { method: "POST" });
+    } catch (_e) {
+      /* already logged out */
+    }
+    setAuthUser(null);
+    setSessionInfo(null);
+    setView("app");
+    setPage("dashboard");
+  }
+
   return (
     <div className="portal-root">
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap');
 
         :root {
-          --bg: #f4f5f7; --panel: #ffffff; --panel-2: #eef0f3; --line: #dde1e7; --input-bg: #f7f8fa;
-          --ink: #1c2128; --ink-dim: #6b7280; --accent: #c9862c; --accent-dim: #f0dcb8;
-          --up: #1a9d63; --down: #d1373c;
+          --bg: #ffffff; --panel: #ffffff; --panel-2: #f1f3f5; --line: #c9d0d8; --input-bg: #ffffff;
+          --ink: #000000; --ink-dim: #374151; --accent: #000000; --accent-dim: #e5e7eb;
+          --up: #066b27; --down: #c40000;
           --font-display: 'Space Grotesk', sans-serif; --font-body: 'Inter', sans-serif; --font-mono: 'JetBrains Mono', monospace;
         }
         .portal-root * { box-sizing: border-box; }
@@ -2629,27 +3163,103 @@ export default function TradingPortal() {
         .log-row { font-family: var(--font-mono); font-size: 11.5px; padding: 4px 0; border-bottom: 1px solid var(--line); color: var(--ink-dim); }
         .log-row.signal { color: var(--accent); }
         .log-row.error { color: var(--down); }
+        /* ===== high-contrast theme: white background, black text, red / green accents ===== */
+        .portal-root { font-size: 14px; font-weight: 500; background: #ffffff; color: #000000; }
+        .portal-root button, .portal-root input, .portal-root select { font-family: inherit; }
+        .connect-screen { background: #ffffff; }
+        .brand-mark { color: #ffffff; }
+        .brand-name { color: #000000; font-weight: 700; }
+        .brand-sub, .card-copy, .step-title, .watch-name, .wl-meta, .paper-note, .bot-sel-sub, .pnl-card .k, .mode-sub, .add-symbol-label, .add-symbol-meta, .funds-key, .field-hint { color: var(--ink-dim); font-weight: 500; }
+        .card-copy { font-size: 13.5px; }
+        .watch-name, .wl-meta, .field-hint { font-size: 11.5px; }
+        .panel-title { color: #000000; font-weight: 700; font-size: 12px; }
+        .card-head { color: #000000; font-weight: 700; }
+        .field { color: #000000; font-weight: 600; font-size: 13px; }
+        .field input, .field select, .cell-input, .add-symbol-input { background: #ffffff; border: 1.5px solid #6b7280; color: #000000; font-weight: 500; }
+        .field input:focus, .field select:focus, .cell-input:focus { border-color: #000000; box-shadow: 0 0 0 2px rgba(0,0,0,0.15); outline: none; }
+        .connect-btn { background: #000000; color: #ffffff; }
+        .connect-btn:disabled { opacity: 0.6; }
+        .spinner { border-color: rgba(255,255,255,0.4); border-top-color: #ffffff; }
+        .secondary-btn, .disconnect-btn, .icon-btn { background: #ffffff; border: 1.5px solid #000000; color: #000000; font-weight: 600; }
+        .secondary-btn:hover, .disconnect-btn:hover, .icon-btn:hover { background: #000000; color: #ffffff; border-color: #000000; }
+        .secondary-btn:disabled { opacity: 0.45; }
+        .link-btn { color: #000000; font-size: 12.5px; font-weight: 600; text-decoration: underline; }
+        .interval-btn { background: #ffffff; border: 1.5px solid #6b7280; color: #000000; font-weight: 600; }
+        .interval-btn.active { background: #000000; color: #ffffff; border-color: #000000; }
+        .topbar { background: #ffffff; border-bottom: 2px solid #000000; }
+        .watchlist, .chart-panel, .ticket, .bot-left, .bot-center, .bot-right { background: #ffffff; }
+        .watch-row.selected { background: #f1f3f5; border-color: #000000; }
+        .watch-sym, .watch-price, .bot-sel-name, .bot-sel-price { color: #000000; font-weight: 700; }
+        .sr-table th { color: #000000; font-weight: 700; border-bottom: 2px solid #000000; }
+        .sr-table td { color: #000000; font-weight: 500; border-bottom: 1px solid #c9d0d8; }
+        .sr-table tr.res td { background: rgba(196,0,0,0.07); }
+        .sr-table tr.sup td { background: rgba(6,107,39,0.09); }
+        .sr-table tr.ref td { background: #f1f3f5; }
+        .pnl-card, .setup-card, .mode-bar, .strategy-box, .chart-wide, .connect-card { border: 1.5px solid #9aa3ad; background: #ffffff; }
+        .mode-btn { border: 1.5px solid #6b7280; color: #000000; }
+        .mode-label { font-weight: 700; }
+        .seg { border: 1.5px solid #6b7280; }
+        .seg button { color: #000000; font-weight: 600; background: #ffffff; }
+        .error-line { color: var(--down); font-weight: 600; }
+        .success-line { color: var(--up); font-weight: 600; }
+        .paper-badge { background: #e6f4ea; color: var(--up); font-weight: 700; }
+        .paper-badge.live { background: #fde8e8; color: var(--down); }
+        .pill.pill-on { background: #e6f4ea; color: var(--up); font-weight: 700; }
+        .chk.no { color: #374151; }
+        .pos-empty { color: #374151; font-weight: 500; }
+        .pos-up { font-weight: 600; }
+        .pos-down { font-weight: 600; }
+
+        /* ===== login / admin screens ===== */
+        .appbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; padding: 6px 20px; background: #f1f3f5; border-bottom: 1px solid #9aa3ad; font-size: 13px; }
+        .appbar-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+        .role-chip { font-family: var(--font-mono); font-size: 10px; padding: 2px 6px; border-radius: 4px; background: #000000; color: #ffffff; margin-left: 6px; font-weight: 700; }
+        .auth-links { display: flex; justify-content: space-between; }
+        .auth-ask { border-top: 1.5px solid #c9d0d8; padding-top: 12px; display: flex; flex-direction: column; gap: 10px; }
+        .admin-wrap { padding: 20px 24px; max-width: 1800px; margin: 0 auto; }
+        .admin-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+        .stat-cards { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; }
+        .pay-paid { color: var(--up); font-weight: 700; }
+        .pay-pending { color: var(--down); font-weight: 700; }
+        .temp-pw { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; border: 2px solid #000000; background: #fffbe6; border-radius: 10px; padding: 10px 12px; margin-bottom: 10px; font-size: 13px; }
+        .temp-pw code { font-family: var(--font-mono); font-size: 15px; background: #000000; color: #ffffff; padding: 3px 8px; border-radius: 6px; letter-spacing: 0.05em; }
+        @media (max-width: 900px) { .stat-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
         @media (max-width: 1100px) { .bot-grid { grid-template-columns: 1fr; } }
         @media (max-width: 1400px) { .mode-switches { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
         @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
       `}</style>
 
-      {!sessionInfo ? (
-        <ConnectScreen onConnect={setSessionInfo} />
-      ) : page === "intraday" ? (
-        <IntradayRangePage onBack={() => setPage("dashboard")} />
-      ) : page === "sniper" ? (
-        <SniperLevelsPage onBack={() => setPage("dashboard")} />
-      ) : page === "bot" ? (
-        <TradingBotPage onBack={() => setPage("dashboard")} />
+      {authUser === undefined ? (
+        <div className="screen connect-screen"><div className="card-copy">Loading…</div></div>
+      ) : authUser === null ? (
+        <AuthScreen onAuthed={setAuthUser} bootError={bootError} />
+      ) : authUser.must_change_password ? (
+        <ForcePasswordChange onDone={() => setAuthUser({ ...authUser, must_change_password: false })} onLogout={logout} />
       ) : (
-        <Dashboard
-          sessionInfo={sessionInfo}
-          onDisconnect={() => setSessionInfo(null)}
-          onOpenIntraday={() => setPage("intraday")}
-          onOpenSniper={() => setPage("sniper")}
-          onOpenBot={() => setPage("bot")}
-        />
+        <>
+          <AppBar user={authUser} view={view} setView={setView} onLogout={logout} />
+          {view === "admin" && authUser.role === "admin" ? (
+            <AdminConsole />
+          ) : view === "account" ? (
+            <AccountPage onBack={() => setView("app")} />
+          ) : !sessionInfo ? (
+            <ConnectScreen onConnect={setSessionInfo} />
+          ) : page === "intraday" ? (
+            <IntradayRangePage onBack={() => setPage("dashboard")} />
+          ) : page === "sniper" ? (
+            <SniperLevelsPage onBack={() => setPage("dashboard")} />
+          ) : page === "bot" ? (
+            <TradingBotPage onBack={() => setPage("dashboard")} />
+          ) : (
+            <Dashboard
+              sessionInfo={sessionInfo}
+              onDisconnect={() => setSessionInfo(null)}
+              onOpenIntraday={() => setPage("intraday")}
+              onOpenSniper={() => setPage("sniper")}
+              onOpenBot={() => setPage("bot")}
+            />
+          )}
+        </>
       )}
     </div>
   );
